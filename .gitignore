@@ -1,0 +1,15 @@
+# Case data exports (sensitive)
+*.csv
+
+# Screenshots
+*.png
+*.jpg
+*.jpeg
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
