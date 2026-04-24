@@ -14,7 +14,7 @@ const PS_SEND = path.join(__dirname, 'send_sf_report.ps1');
 const TASK_NAME = 'SF_Team_Report';
 
 const SF_ORG = 'kaltura';
-const TEAM_NAMES = [
+let TEAM_NAMES = [
   'Russ Lichterman','Darwin Mitra','Fahad Mizi','Alex De Los Santos',
   'Tahmid Hassan','Roxy Hennessy','Rick Rehmann','Zach Hill',
   'Oscar Lagua Espin','Hector Zurita','Agustin Herling','Stivan Tenev',
@@ -24,6 +24,19 @@ const DISPLAY = {
   'Oscar Lagua Espin': 'Oscar Espin',
   'Julian Lucena Herrera': 'Julian Herrera'
 };
+
+// ── Settings persistence ──────────────────────────────────────────────────────
+const SETTINGS_FILE = path.join(__dirname, 'settings.json');
+(function loadSettingsFile() {
+  try {
+    if (fs.existsSync(SETTINGS_FILE)) {
+      const s = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+      if (Array.isArray(s.teamNames) && s.teamNames.length) {
+        TEAM_NAMES = s.teamNames;
+      }
+    }
+  } catch(e) { /* fall back to defaults */ }
+})();
 const OPEN_STATUSES = [
   'New','In Progress','In Work','Awaiting Customer Response','Awaiting CSM',
   'Awaiting Tier 3','Awaiting ADA Team','Awaiting PS','Awaiting Product',
@@ -194,16 +207,26 @@ function queryJpmcCases() {
   return new Promise((resolve, reject) => {
     const soql = `SELECT Id, CaseNumber, Subject, Status, Priority, Assigned_To__c, Assigned_To__r.Name, Contact.Name, Contact.FirstName, Contact.Email, Description, CreatedDate FROM Case WHERE Status = 'New' AND Assigned_To__c = null AND Subject LIKE '%Video recovery request%' AND Account.Name = 'J.P. Morgan Chase & Co.' ORDER BY CreatedDate DESC LIMIT 100`;
     const tmpSoql = path.join(os.tmpdir(), 'sf_jpmc_query.soql');
-    const tmpCsv  = path.join(os.tmpdir(), 'sf_jpmc_out.csv');
+    const tmpJson = path.join(os.tmpdir(), 'sf_jpmc_out.json');
     fs.writeFileSync(tmpSoql, soql, 'utf8');
     execFile('powershell', [
       '-Command',
-      `& '${SF_CMD}' data query --target-org ${SF_ORG} --result-format csv --file '${tmpSoql}' --output-file '${tmpCsv}'; exit 0`
+      `& '${SF_CMD}' data query --target-org ${SF_ORG} --result-format json --file '${tmpSoql}' --output-file '${tmpJson}'; exit 0`
     ], { maxBuffer: 10 * 1024 * 1024, timeout: 60000 }, (err, stdout, stderr) => {
       try {
-        const raw = fs.readFileSync(tmpCsv, 'utf8');
-        const lines = raw.split(/\r?\n/).filter(Boolean);
-        resolve(parseCSVGeneric(lines));
+        const raw = JSON.parse(fs.readFileSync(tmpJson, 'utf8'));
+        const records = (raw.result || raw).records || raw.result || [];
+        const flat = records.map(r => {
+          const out = { ...r };
+          if (r.Contact) {
+            out['Contact.Name']      = r.Contact.Name      || '';
+            out['Contact.FirstName'] = r.Contact.FirstName || '';
+            out['Contact.Email']     = r.Contact.Email     || '';
+          }
+          if (r.Assigned_To__r) out['Assigned_To__r.Name'] = r.Assigned_To__r.Name || '';
+          return out;
+        }).filter(r => !r.Assigned_To__c); // double-check: only truly unassigned
+        resolve(flat);
       } catch(e) {
         reject(new Error(stderr || (err && err.message) || e.message));
       }
@@ -803,6 +826,9 @@ input:focus,select:focus{border-color:#0078d4;box-shadow:0 0 0 2px rgba(0,120,21
   <button class="nav-tab" id="tab-jpmc" onclick="switchTab('jpmc')">
     <i class="fa fa-building"></i> JPMC Restore Request
   </button>
+  <button class="nav-tab" id="tab-settings" onclick="switchTab('settings')" style="margin-left:auto">
+    <i class="fa fa-gear"></i> Settings
+  </button>
 </div>
 
 <div class="main" id="mainContent">
@@ -937,6 +963,45 @@ input:focus,select:focus{border-color:#0078d4;box-shadow:0 0 0 2px rgba(0,120,21
         <textarea id="templatePreview" spellcheck="false" style="width:100%;padding:12px 14px;font-size:11px;color:#333;line-height:1.6;height:400px;resize:vertical;border:none;outline:none;background:#fafbff;border-radius:0 0 10px 10px;font-family:Segoe UI,Arial,sans-serif">Hover a case row to preview...</textarea>
       </div>
     </div>
+    </div>
+  </div>
+
+  <!-- Settings Page -->
+  <div id="page-settings" style="display:none">
+    <div style="max-width:640px">
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-header">
+          <div class="card-title"><i class="fa fa-users" style="color:#0052cc"></i> Team Members (User List)</div>
+          <button class="btn" style="background:#0052cc;color:#fff;border-color:#0052cc;font-size:11px" onclick="saveSettings()">
+            <i class="fa fa-floppy-disk"></i> Save Changes
+          </button>
+        </div>
+        <div style="padding:10px 16px;border-bottom:1px solid #f0f0f0;color:#666;font-size:12px">
+          Names must match exactly as they appear in Salesforce. Changes affect case queries, reports, and the JPMC assignee pool.
+        </div>
+        <div id="settingsTeamList" style="min-height:60px"></div>
+        <div style="padding:12px 16px;border-top:1px solid #f0f0f0">
+          <div style="position:relative">
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+              <i class="fa fa-magnifying-glass" style="color:#0078d4;font-size:12px"></i>
+              <input type="text" id="addMemberInput" placeholder="Search by name or paste User ID (18-char)…"
+                style="flex:1;padding:7px 10px;border:1.5px solid #d0d8e8;border-radius:6px;font-size:12px;outline:none"
+                oninput="debouncedSettingsSearch(this.value)"
+                autocomplete="off">
+            </div>
+            <div id="settingsSearchResults"
+              style="display:none;position:absolute;bottom:100%;left:0;right:0;background:#fff;border:1px solid #d0d8e8;border-radius:6px;max-height:220px;overflow-y:auto;z-index:50;box-shadow:0 -4px 16px rgba(0,0,0,0.12);margin-bottom:4px">
+            </div>
+          </div>
+          <div style="font-size:11px;color:#aaa;margin-top:4px">
+            <i class="fa fa-circle-info" style="color:#0078d4"></i> Search pulls live results from Salesforce
+          </div>
+        </div>
+      </div>
+      <div style="font-size:11px;color:#aaa;padding:0 4px">
+        <i class="fa fa-circle-info" style="color:#0078d4"></i>
+        After saving, refresh the JPMC tab or reload to apply changes to all queries.
+      </div>
     </div>
   </div>
 </div>
@@ -1320,11 +1385,12 @@ function toast(msg, type='info') {
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
 function switchTab(tab) {
-  ['report','handling','dashboard','jpmc'].forEach(t => {
+  ['report','handling','dashboard','jpmc','settings'].forEach(t => {
     document.getElementById('page-' + t).style.display = t === tab ? '' : 'none';
     document.getElementById('tab-' + t).classList.toggle('active', t === tab);
   });
   if (tab === 'handling' && !chLoaded) loadCaseHandling();
+  if (tab === 'settings') loadSettingsTab();
   if (tab === 'jpmc') {
     // Restore saved auto-refresh timer when entering the tab
     if (!jpmcRefreshTimer) {
@@ -2375,13 +2441,144 @@ function showCases(idx, period) {
 dashPinned.forEach(id => updatePinButton(id, true));
 
 loadData();
+
+// ── Settings Tab ──────────────────────────────────────────────────────────────
+// teamMembers: [{name, id}]  (id may be null if SF lookup not yet run)
+let settingsTeamMembers = null;
+let settingsLoaded = false;
+let settingsSearchTimer = null;
+let _settingsSearchUsers = [];
+
+async function loadSettingsTab() {
+  if (settingsLoaded) return;
+  try {
+    const res = await fetch('/api/settings');
+    const data = await res.json();
+    // data.teamMembers = [{name, id}]
+    settingsTeamMembers = data.teamMembers || (data.teamNames || []).map(n => ({ name: n, id: null }));
+    renderSettingsTeamList();
+    settingsLoaded = true;
+  } catch(e) {
+    toast('Failed to load settings: ' + e.message, 'error');
+  }
+}
+
+function renderSettingsTeamList() {
+  const el = document.getElementById('settingsTeamList');
+  if (!el) return;
+  const members = settingsTeamMembers || [];
+  if (!members.length) {
+    el.innerHTML = '<div style="padding:16px;color:#aaa;font-size:12px;text-align:center">No team members defined. Search above to add.</div>';
+    return;
+  }
+  const e = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  el.innerHTML = '<table style="margin:0"><thead><tr>' +
+    '<th style="width:30px;color:#aaa;font-weight:400">#</th>' +
+    '<th>Name &amp; SF User ID</th>' +
+    '<th style="width:70px;text-align:center">Remove</th>' +
+    '</tr></thead><tbody>' +
+    members.map((m, i) =>
+      '<tr>' +
+      '<td style="color:#aaa;font-size:11px">' + (i + 1) + '</td>' +
+      '<td><span style="font-weight:600">' + e(m.name) + '</span>' +
+        (m.id ? ' <span style="font-size:10px;color:#aaa;font-family:monospace;margin-left:6px">' + e(m.id) + '</span>' : '') +
+      '</td>' +
+      '<td style="text-align:center">' +
+      '<button onclick="removeTeamMember(' + i + ')" style="background:none;border:1.5px solid #f5c0c0;border-radius:5px;cursor:pointer;color:#cc0000;font-size:11px;padding:2px 8px;line-height:1.6" title="Remove">' +
+      '<i class="fa fa-times"></i></button>' +
+      '</td></tr>'
+    ).join('') +
+    '</tbody></table>';
+}
+
+function debouncedSettingsSearch(q) {
+  clearTimeout(settingsSearchTimer);
+  const res = document.getElementById('settingsSearchResults');
+  if (!q || q.length < 2) { if (res) res.style.display = 'none'; return; }
+  settingsSearchTimer = setTimeout(() => doSettingsUserSearch(q), 300);
+}
+
+async function doSettingsUserSearch(q) {
+  var res = document.getElementById('settingsSearchResults');
+  if (!res) return;
+  res.style.display = 'block';
+  res.innerHTML = '<div style="padding:10px 14px;font-size:12px;color:#aaa">Searching Salesforce...</div>';
+  try {
+    var data = await fetch('/api/search-users?q=' + encodeURIComponent(q)).then(function(r){ return r.json(); });
+    if (!data.users || !data.users.length) {
+      res.innerHTML = '<div style="padding:10px 14px;font-size:12px;color:#aaa">No users found</div>';
+      return;
+    }
+    _settingsSearchUsers = data.users;
+    var e = function(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
+    res.innerHTML = data.users.map(function(u, idx) {
+      return '<div class="sf-result-row" data-idx="' + idx + '" style="padding:10px 14px;cursor:pointer;border-bottom:1px solid #f0f4ff;font-size:12px;">' +
+        '<div style="font-weight:600">' + e(u.name) + '</div>' +
+        '<div style="font-size:10px;color:#0078d4;font-family:monospace;margin-top:2px">' + e(u.id) + (u.email ? ' &middot; ' + e(u.email) : '') + '</div>' +
+        '</div>';
+    }).join('');
+    res.querySelectorAll('.sf-result-row').forEach(function(row) {
+      row.onmouseover = function(){ this.style.background = '#f0f4ff'; };
+      row.onmouseout  = function(){ this.style.background = ''; };
+      row.onclick     = function(){ addTeamMemberFromSearch(_settingsSearchUsers[parseInt(this.getAttribute('data-idx'))]); };
+    });
+  } catch(err) {
+    res.innerHTML = '<div style="padding:10px 14px;font-size:12px;color:#c00">' + String(err.message).replace(/</g,'&lt;') + '</div>';
+  }
+}
+
+function addTeamMemberFromSearch(user) {
+  if (!settingsTeamMembers) settingsTeamMembers = [];
+  if (settingsTeamMembers.find(m => m.id === user.id || m.name === user.name)) {
+    toast('Already in list', 'info'); return;
+  }
+  settingsTeamMembers.push({ name: user.name, id: user.id });
+  document.getElementById('addMemberInput').value = '';
+  document.getElementById('settingsSearchResults').style.display = 'none';
+  renderSettingsTeamList();
+}
+
+// Close dropdown on outside click
+document.addEventListener('click', function(e) {
+  const inp = document.getElementById('addMemberInput');
+  const res = document.getElementById('settingsSearchResults');
+  if (res && inp && !inp.contains(e.target) && !res.contains(e.target)) res.style.display = 'none';
+});
+
+function removeTeamMember(i) {
+  if (!settingsTeamMembers) return;
+  settingsTeamMembers.splice(i, 1);
+  renderSettingsTeamList();
+}
+
+async function saveSettings() {
+  if (!settingsTeamMembers || !settingsTeamMembers.length) {
+    toast('Cannot save empty team list', 'error');
+    return;
+  }
+  try {
+    const teamNames = settingsTeamMembers.map(m => m.name);
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ teamNames })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    toast('Settings saved — ' + teamNames.length + ' members', 'success');
+    jpmcLoaded = false;
+    chLoaded = false;
+    jpmcTeamUsers = null;
+    settingsLoaded = false; // reload on next visit to refresh IDs
+  } catch(e) { toast('Save failed: ' + e.message, 'error'); }
+}
 </script>
 </body></html>`;
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  const { pathname } = url.parse(req.url);
-  const method = req.method;
+  const parsedUrl = url.parse(req.url, true);
+  const pathname  = parsedUrl.pathname;
+  const method    = req.method;
 
   const send = (code, body, ct = 'application/json') => {
     res.writeHead(code, { 'Content-Type': ct, 'Access-Control-Allow-Origin': '*' });
@@ -2484,6 +2681,55 @@ const server = http.createServer(async (req, res) => {
       const { caseId, commentBody, firstName } = JSON.parse(await body());
       await respondToCase(caseId, firstName, commentBody);
       send(200, 'ok', 'text/plain');
+    } catch(e) { send(500, e.message, 'text/plain'); }
+    return;
+  }
+
+  if (method === 'GET' && pathname === '/api/search-users') {
+    const q = (parsedUrl.query.q || '').trim().replace(/'/g, "\\'");
+    if (!q) { send(200, { users: [] }); return; }
+    try {
+      const isIdLike = /^[a-zA-Z0-9]{15,18}$/.test(q);
+      const idClause = isIdLike ? ` OR Id = '${q}'` : '';
+      const soql = `SELECT Id, Name, Email FROM User WHERE IsActive = true AND (Name LIKE '%${q}%' OR Email LIKE '%${q}%'${idClause}) ORDER BY Name LIMIT 20`;
+      const tmpSoql = path.join(os.tmpdir(), 'sf_usersearch.soql');
+      const tmpJson = path.join(os.tmpdir(), 'sf_usersearch.json');
+      fs.writeFileSync(tmpSoql, soql, 'utf8');
+      await new Promise((resolve, reject) => {
+        execFile('powershell', ['-Command',
+          `& '${SF_CMD}' data query --target-org ${SF_ORG} --result-format json --file '${tmpSoql}' --output-file '${tmpJson}'; exit 0`
+        ], { maxBuffer: 2 * 1024 * 1024, timeout: 30000 }, (err, stdout, stderr) => {
+          try {
+            const raw = JSON.parse(fs.readFileSync(tmpJson, 'utf8'));
+            const records = (raw.result || raw).records || [];
+            send(200, { users: records.map(r => ({ id: r.Id, name: r.Name, email: r.Email || '' })) });
+            resolve();
+          } catch(e) { reject(new Error(stderr || (err && err.message) || e.message)); }
+        });
+      });
+    } catch(e) { send(500, e.message, 'text/plain'); }
+    return;
+  }
+
+  if (method === 'GET' && pathname === '/api/settings') {
+    try {
+      const userIds = await getTeamUserIds().catch(() => ({}));
+      const teamMembers = TEAM_NAMES.map(n => ({ name: n, id: userIds[n] || null }));
+      send(200, { teamNames: TEAM_NAMES, teamMembers });
+    } catch(e) {
+      send(200, { teamNames: TEAM_NAMES, teamMembers: TEAM_NAMES.map(n => ({ name: n, id: null })) });
+    }
+    return;
+  }
+
+  if (method === 'POST' && pathname === '/api/settings') {
+    try {
+      const { teamNames } = JSON.parse(await body());
+      if (!Array.isArray(teamNames) || !teamNames.length) throw new Error('Invalid team names list');
+      TEAM_NAMES = teamNames.map(n => String(n).trim()).filter(Boolean);
+      fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ teamNames: TEAM_NAMES }, null, 2), 'utf8');
+      _teamUserIds = null; // reset SF user ID cache
+      send(200, { teamNames: TEAM_NAMES });
     } catch(e) { send(500, e.message, 'text/plain'); }
     return;
   }
