@@ -1,7 +1,8 @@
 // SF Team Report Server — run with:
 // "C:\Program Files\sf\client\bin\node.exe" sf_report_server.js
 
-const http = require('http');
+const http  = require('http');
+const https = require('https');
 const { execFile, exec } = require('child_process');
 const url  = require('url');
 const fs   = require('fs');
@@ -307,6 +308,120 @@ function queryJpmcNewCases() {
             out['Contact.FirstName'] = r.Contact.FirstName || '';
             out['Contact.Email']     = r.Contact.Email     || '';
           }
+          if (r.Assigned_To__r) out['Assigned_To__r.Name'] = r.Assigned_To__r.Name || '';
+          if (r.Owner)          out['Owner.Name']           = r.Owner.Name          || '';
+          return out;
+        });
+        resolve(flat);
+      } catch(e) {
+        reject(new Error(stderr || (err && err.message) || e.message));
+      }
+    });
+  });
+}
+
+// ── General Restore Cases query (unassigned, New, non-JPMC) ──────────────────
+function queryGeneralCases() {
+  return new Promise((resolve, reject) => {
+    const soql = `SELECT Id, CaseNumber, Subject, Status, Priority, Assigned_To__c, Assigned_To__r.Name, Contact.Name, Contact.FirstName, Contact.Email, Account.Name, Description, CreatedDate FROM Case WHERE Status = 'New' AND Assigned_To__c = null AND (Subject LIKE '%entry%' OR Subject LIKE '%recover%' OR Subject LIKE '%restore%' OR Subject LIKE '%video%' OR Subject LIKE '%channel%') AND Account.Name != 'J.P. Morgan Chase & Co.' ORDER BY CreatedDate DESC LIMIT 100`;
+    const tmpSoql = path.join(os.tmpdir(), 'sf_general_query.soql');
+    const tmpJson = path.join(os.tmpdir(), 'sf_general_out.json');
+    fs.writeFileSync(tmpSoql, soql, 'utf8');
+    execFile('powershell', ['-Command',
+      `& '${SF_CMD}' data query --target-org ${SF_ORG} --result-format json --file '${tmpSoql}' --output-file '${tmpJson}'; exit 0`
+    ], { maxBuffer: 10 * 1024 * 1024, timeout: 60000 }, (err, stdout, stderr) => {
+      try {
+        const raw = JSON.parse(fs.readFileSync(tmpJson, 'utf8'));
+        const records = (raw.result || raw).records || [];
+        const flat = records.map(r => {
+          const out = { ...r };
+          if (r.Contact) {
+            out['Contact.Name']      = r.Contact.Name      || '';
+            out['Contact.FirstName'] = r.Contact.FirstName || '';
+            out['Contact.Email']     = r.Contact.Email     || '';
+          }
+          if (r.Account) out['Account.Name'] = r.Account.Name || '';
+          if (r.Assigned_To__r) out['Assigned_To__r.Name'] = r.Assigned_To__r.Name || '';
+          return out;
+        }).filter(r => !r.Assigned_To__c);
+        resolve(flat);
+      } catch(e) {
+        reject(new Error(stderr || (err && err.message) || e.message));
+      }
+    });
+  });
+}
+
+// ── General Restore Stats query (YTD, non-JPMC) ───────────────────────────────
+function queryGeneralStats() {
+  const subjectFilter = `(Subject LIKE '%entry%' OR Subject LIKE '%recover%' OR Subject LIKE '%restore%' OR Subject LIKE '%video%' OR Subject LIKE '%channel%')`;
+  const queryRestore = () => new Promise((resolve, reject) => {
+    const soql = `SELECT Id, CaseNumber, Status, CreatedDate FROM Case WHERE ${subjectFilter} AND Account.Name != 'J.P. Morgan Chase & Co.' AND CreatedDate >= 2026-01-01T00:00:00Z ORDER BY CreatedDate ASC LIMIT 2000`;
+    const tmpSoql = path.join(os.tmpdir(), 'sf_general_stats.soql');
+    const tmpJson = path.join(os.tmpdir(), 'sf_general_stats.json');
+    fs.writeFileSync(tmpSoql, soql, 'utf8');
+    execFile('powershell', ['-Command',
+      `& '${SF_CMD}' data query --target-org ${SF_ORG} --result-format json --file '${tmpSoql}' --output-file '${tmpJson}'; exit 0`
+    ], { maxBuffer: 10 * 1024 * 1024, timeout: 60000 }, (err, stdout, stderr) => {
+      try {
+        const raw = JSON.parse(fs.readFileSync(tmpJson, 'utf8'));
+        resolve((raw.result || raw).records || []);
+      } catch(e) { reject(new Error(stderr || (err && err.message) || e.message)); }
+    });
+  });
+  const queryTotal = () => new Promise((resolve) => {
+    const soql = `SELECT COUNT(Id) total FROM Case WHERE Account.Name != 'J.P. Morgan Chase & Co.' AND CreatedDate >= 2026-01-01T00:00:00Z`;
+    const tmpSoql = path.join(os.tmpdir(), 'sf_general_total.soql');
+    const tmpJson = path.join(os.tmpdir(), 'sf_general_total.json');
+    fs.writeFileSync(tmpSoql, soql, 'utf8');
+    execFile('powershell', ['-Command',
+      `& '${SF_CMD}' data query --target-org ${SF_ORG} --result-format json --file '${tmpSoql}' --output-file '${tmpJson}'; exit 0`
+    ], { maxBuffer: 1 * 1024 * 1024, timeout: 30000 }, (err, stdout, stderr) => {
+      try {
+        const raw = JSON.parse(fs.readFileSync(tmpJson, 'utf8'));
+        const recs = (raw.result || raw).records || [];
+        resolve(recs[0] ? (recs[0].total || recs[0].expr0 || 0) : 0);
+      } catch(e) { resolve(0); }
+    });
+  });
+  return Promise.all([queryRestore(), queryTotal()]).then(([records, totalAll]) => {
+    const daily = {}, weekly = {}, monthly = {};
+    records.forEach(r => {
+      const d = new Date(r.CreatedDate);
+      const dayKey   = d.toISOString().slice(0, 10);
+      const monthKey = d.toISOString().slice(0, 7);
+      const jan1 = new Date(d.getFullYear(), 0, 1);
+      const week = Math.ceil(((d - jan1) / 86400000 + jan1.getDay() + 1) / 7);
+      const weekKey = d.getFullYear() + '-W' + String(week).padStart(2, '0');
+      daily[dayKey]     = (daily[dayKey]     || 0) + 1;
+      weekly[weekKey]   = (weekly[weekKey]   || 0) + 1;
+      monthly[monthKey] = (monthly[monthKey] || 0) + 1;
+    });
+    return { total: records.length, totalAll: Number(totalAll), daily, weekly, monthly };
+  });
+}
+
+// ── General All Open Restore Cases query (non-JPMC) ───────────────────────────
+function queryGeneralNewCases() {
+  return new Promise((resolve, reject) => {
+    const soql = `SELECT Id, CaseNumber, Subject, Status, Priority, Assigned_To__c, Assigned_To__r.Name, OwnerId, Owner.Name, Contact.Name, Contact.FirstName, Contact.Email, Account.Name, Description, CreatedDate FROM Case WHERE IsClosed = false AND (Subject LIKE '%entry%' OR Subject LIKE '%recover%' OR Subject LIKE '%restore%' OR Subject LIKE '%video%' OR Subject LIKE '%channel%') AND Account.Name != 'J.P. Morgan Chase & Co.' ORDER BY CreatedDate DESC LIMIT 300`;
+    const tmpSoql = path.join(os.tmpdir(), 'sf_general_new_query.soql');
+    const tmpJson = path.join(os.tmpdir(), 'sf_general_new_out.json');
+    fs.writeFileSync(tmpSoql, soql, 'utf8');
+    execFile('powershell', ['-Command',
+      `& '${SF_CMD}' data query --target-org ${SF_ORG} --result-format json --file '${tmpSoql}' --output-file '${tmpJson}'; exit 0`
+    ], { maxBuffer: 10 * 1024 * 1024, timeout: 60000 }, (err, stdout, stderr) => {
+      try {
+        const raw = JSON.parse(fs.readFileSync(tmpJson, 'utf8'));
+        const records = (raw.result || raw).records || [];
+        const flat = records.map(r => {
+          const out = { ...r };
+          if (r.Contact) {
+            out['Contact.Name']      = r.Contact.Name      || '';
+            out['Contact.FirstName'] = r.Contact.FirstName || '';
+            out['Contact.Email']     = r.Contact.Email     || '';
+          }
+          if (r.Account) out['Account.Name'] = r.Account.Name || '';
           if (r.Assigned_To__r) out['Assigned_To__r.Name'] = r.Assigned_To__r.Name || '';
           if (r.Owner)          out['Owner.Name']           = r.Owner.Name          || '';
           return out;
@@ -826,6 +941,9 @@ input:focus,select:focus{border-color:#0078d4;box-shadow:0 0 0 2px rgba(0,120,21
   <button class="nav-tab" id="tab-jpmc" onclick="switchTab('jpmc')">
     <i class="fa fa-building"></i> JPMC Restore Request
   </button>
+  <button class="nav-tab" id="tab-general" onclick="switchTab('general')">
+    <i class="fa fa-rotate-left"></i> Restore Request
+  </button>
   <button class="nav-tab" id="tab-settings" onclick="switchTab('settings')" style="margin-left:auto">
     <i class="fa fa-gear"></i> Settings
   </button>
@@ -854,6 +972,10 @@ input:focus,select:focus{border-color:#0078d4;box-shadow:0 0 0 2px rgba(0,120,21
     <div class="grid-stack" id="dashGrid" style="display:none"></div>
   </div>
   <div id="page-jpmc" style="display:none">
+    <!-- Kaltura Admin Connect -->
+    <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
+      <div id="kalturaAdminStatus"></div>
+    </div>
     <!-- JPMC Stats Dashboard -->
     <div class="card grid-full" id="jpmcStatsCard" style="margin-bottom:16px">
       <div class="card-header">
@@ -966,41 +1088,207 @@ input:focus,select:focus{border-color:#0078d4;box-shadow:0 0 0 2px rgba(0,120,21
     </div>
   </div>
 
-  <!-- Settings Page -->
-  <div id="page-settings" style="display:none">
-    <div style="max-width:640px">
-      <div class="card" style="margin-bottom:20px">
-        <div class="card-header">
-          <div class="card-title"><i class="fa fa-users" style="color:#0052cc"></i> Team Members (User List)</div>
-          <button class="btn" style="background:#0052cc;color:#fff;border-color:#0052cc;font-size:11px" onclick="saveSettings()">
-            <i class="fa fa-floppy-disk"></i> Save Changes
+  <!-- General Restore Request Tab -->
+  <div id="page-general" style="display:none">
+    <!-- Section 1: Dashboard / Stats -->
+    <div class="card grid-full" id="generalStatsCard" style="margin-bottom:16px">
+      <div class="card-header">
+        <div style="display:flex;align-items:center;gap:8px">
+          <button id="collapse-general-stats" class="btn-collapse" onclick="toggleGeneralSection('stats')" title="Collapse"><i class="fa fa-chevron-down"></i></button>
+          <div class="card-title">
+            <i class="fa fa-chart-line" style="color:#0052cc"></i> Restore Requests — 2026 Overview (Non-JPMC)
+            <span class="badge badge-blue" id="generalStatTotalBadge" style="margin-left:8px"></span>
+          </div>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button id="generalStatsBtnDay7"  class="ch-period-btn active" onclick="setGeneralStatsPeriod('day7')">7 Days</button>
+          <button id="generalStatsBtnDay30" class="ch-period-btn"        onclick="setGeneralStatsPeriod('day30')">30 Days</button>
+          <button id="generalStatsBtnDay90" class="ch-period-btn"        onclick="setGeneralStatsPeriod('day90')">90 Days</button>
+          <button id="generalStatsBtnWeek"  class="ch-period-btn"        onclick="setGeneralStatsPeriod('weekly')">Weekly</button>
+          <button id="generalStatsBtnMonth" class="ch-period-btn"        onclick="setGeneralStatsPeriod('monthly')">Monthly</button>
+          <button class="btn btn-secondary" style="font-size:11px;margin-left:6px" onclick="loadGeneralStats()">
+            <i class="fa fa-rotate-right"></i>
           </button>
         </div>
-        <div style="padding:10px 16px;border-bottom:1px solid #f0f0f0;color:#666;font-size:12px">
-          Names must match exactly as they appear in Salesforce. Changes affect case queries, reports, and the JPMC assignee pool.
+      </div>
+      <div id="generalStatsBody" class="collapse-body" style="max-height:600px">
+        <div id="generalStatsLoader" style="display:flex;align-items:center;gap:12px;padding:20px 16px">
+          <div class="spinner"></div><span style="color:#888;font-size:13px">Loading stats...</span>
         </div>
-        <div id="settingsTeamList" style="min-height:60px"></div>
-        <div style="padding:12px 16px;border-top:1px solid #f0f0f0">
-          <div style="position:relative">
-            <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
-              <i class="fa fa-magnifying-glass" style="color:#0078d4;font-size:12px"></i>
-              <input type="text" id="addMemberInput" placeholder="Search by name or paste User ID (18-char)…"
-                style="flex:1;padding:7px 10px;border:1.5px solid #d0d8e8;border-radius:6px;font-size:12px;outline:none"
-                oninput="debouncedSettingsSearch(this.value)"
-                autocomplete="off">
+        <div id="generalStatsContent" style="display:none">
+          <div style="display:flex;gap:16px;padding:16px 20px 0">
+            <div style="flex:0 0 200px;display:flex;flex-direction:column;gap:10px">
+              <div class="ch-stat-card today" style="padding:14px 16px">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                  <span class="ch-stat-label" style="margin:0">Restore Requests</span>
+                  <span id="generalStatRestorePct" style="font-size:13px;font-weight:800;color:#0078d4;background:#e8f0fe;padding:2px 8px;border-radius:10px">—%</span>
+                </div>
+                <div class="ch-stat-value" id="generalStatTotal" style="font-size:30px">—</div>
+                <div class="ch-stat-sub">of 2026 non-JPMC tickets</div>
+              </div>
+              <div class="ch-stat-card week" style="padding:14px 16px">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                  <span class="ch-stat-label" style="margin:0">Other Tickets</span>
+                  <span id="generalStatNonRestorePct" style="font-size:13px;font-weight:800;color:#0052cc;background:#e8eeff;padding:2px 8px;border-radius:10px">—%</span>
+                </div>
+                <div class="ch-stat-value" id="generalStatTotalAll" style="font-size:30px">—</div>
+                <div class="ch-stat-sub">other non-JPMC tickets 2026</div>
+              </div>
             </div>
-            <div id="settingsSearchResults"
-              style="display:none;position:absolute;bottom:100%;left:0;right:0;background:#fff;border:1px solid #d0d8e8;border-radius:6px;max-height:220px;overflow-y:auto;z-index:50;box-shadow:0 -4px 16px rgba(0,0,0,0.12);margin-bottom:4px">
+            <div style="flex:1;min-height:240px;padding-bottom:16px">
+              <canvas id="generalStatsChart"></canvas>
             </div>
-          </div>
-          <div style="font-size:11px;color:#aaa;margin-top:4px">
-            <i class="fa fa-circle-info" style="color:#0078d4"></i> Search pulls live results from Salesforce
           </div>
         </div>
       </div>
-      <div style="font-size:11px;color:#aaa;padding:0 4px">
-        <i class="fa fa-circle-info" style="color:#0078d4"></i>
-        After saving, refresh the JPMC tab or reload to apply changes to all queries.
+    </div>
+
+    <!-- Section 2: Entry Restore Requests (unassigned new) -->
+    <div id="generalRestoreSection">
+      <div class="jpmc-section-divider" style="margin:20px 0 12px;cursor:pointer" onclick="toggleGeneralSection('restore')">
+        <button id="collapse-general-restore" class="btn-collapse" style="margin-right:4px" onclick="event.stopPropagation();toggleGeneralSection('restore')"><i class="fa fa-chevron-down"></i></button>
+        <i class="fa fa-inbox-in" style="color:#e65c00"></i> Entry Restore Requests
+        <span class="badge badge-orange" id="generalRestoreBadge" style="margin-left:6px"></span>
+      </div>
+      <div id="generalRestoreBody" class="collapse-body" style="max-height:2000px">
+        <div class="loading" id="generalLoader" style="display:none">
+          <div class="spinner"></div>
+          <div>Loading restore request cases from Salesforce...</div>
+        </div>
+        <div id="generalContent"></div>
+      </div>
+    </div>
+
+    <!-- Section 3: All Open Entry Restore Requests (categorized) -->
+    <div class="jpmc-section-divider" style="margin:20px 0 12px;cursor:pointer" onclick="toggleGeneralSection('open')">
+      <button id="collapse-general-open" class="btn-collapse" style="margin-right:4px" onclick="event.stopPropagation();toggleGeneralSection('open')"><i class="fa fa-chevron-down"></i></button>
+      <i class="fa fa-list-check" style="color:#0078d4"></i> All Open Entry Restore Requests
+    </div>
+    <div id="generalOpenBody" class="collapse-body" style="max-height:4000px">
+      <div class="card" id="generalNewCasesCard">
+        <div class="card-header">
+          <div class="card-title"><i class="fa fa-table-list"></i> All Open Restore Cases <span class="badge badge-blue" id="generalNewBadge"></span></div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <div class="jpmc-schedule-wrap">
+              <i class="fa fa-filter" style="color:#0078d4;font-size:12px"></i>
+              <select id="generalNewStatusFilter" class="jpmc-schedule-sel" onchange="filterGeneralNewCases()">
+                <option value="all" selected>All statuses</option>
+                <option value="New">New</option>
+                <option value="In Progress">In Progress</option>
+                <option value="In Work">In Work</option>
+                <option value="Awaiting Customer Response">Awaiting Customer Response</option>
+                <option value="Customer Responded">Customer Responded</option>
+                <option value="Review Customer Response">Review Customer Response</option>
+                <option value="Review Internal">Review Internal</option>
+                <option value="On Hold">On Hold</option>
+                <option value="Resolved">Resolved</option>
+              </select>
+            </div>
+            <button class="btn btn-secondary" style="font-size:11px" onclick="loadGeneralNewCases()">
+              <i class="fa fa-rotate-right"></i> Refresh
+            </button>
+          </div>
+        </div>
+        <div class="loading" id="generalNewLoader" style="display:flex;padding:24px">
+          <div class="spinner"></div><div style="margin-left:12px">Loading...</div>
+        </div>
+        <div id="generalNewContent" style="display:none;padding:12px 16px"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings Page -->
+  <div id="page-settings" style="display:none">
+    <div style="display:flex;gap:20px;align-items:flex-start">
+
+      <!-- Left column: Team Members -->
+      <div style="width:400px;flex-shrink:0">
+        <div class="card" style="margin-bottom:12px">
+          <div class="card-header">
+            <div class="card-title"><i class="fa fa-users" style="color:#0052cc"></i> Team Members (User List)</div>
+            <button class="btn" style="background:#0052cc;color:#fff;border-color:#0052cc;font-size:11px" onclick="saveSettings()">
+              <i class="fa fa-floppy-disk"></i> Save Changes
+            </button>
+          </div>
+          <div style="padding:10px 16px;border-bottom:1px solid #f0f0f0;color:#666;font-size:12px">
+            Names must match exactly as they appear in Salesforce. Changes affect case queries, reports, and the JPMC assignee pool.
+          </div>
+          <div id="settingsTeamList" style="min-height:60px"></div>
+          <div style="padding:12px 16px;border-top:1px solid #f0f0f0">
+            <div style="position:relative">
+              <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+                <i class="fa fa-magnifying-glass" style="color:#0078d4;font-size:12px"></i>
+                <input type="text" id="addMemberInput" placeholder="Search by name or paste User ID (18-char)…"
+                  style="flex:1;padding:7px 10px;border:1.5px solid #d0d8e8;border-radius:6px;font-size:12px;outline:none"
+                  oninput="debouncedSettingsSearch(this.value)"
+                  autocomplete="off">
+              </div>
+              <div id="settingsSearchResults"
+                style="display:none;position:absolute;bottom:100%;left:0;right:0;background:#fff;border:1px solid #d0d8e8;border-radius:6px;max-height:220px;overflow-y:auto;z-index:50;box-shadow:0 -4px 16px rgba(0,0,0,0.12);margin-bottom:4px">
+              </div>
+            </div>
+            <div style="font-size:11px;color:#aaa;margin-top:4px">
+              <i class="fa fa-circle-info" style="color:#0078d4"></i> Search pulls live results from Salesforce
+            </div>
+          </div>
+        </div>
+        <div style="font-size:11px;color:#aaa;padding:0 4px">
+          <i class="fa fa-circle-info" style="color:#0078d4"></i>
+          After saving, refresh the JPMC tab or reload to apply changes to all queries.
+        </div>
+      </div>
+
+      <!-- Right column: Response Templates -->
+      <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:16px">
+
+        <!-- Template 1: Restored -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title"><i class="fa fa-circle-check" style="color:#2da44e"></i> Template — Restored</div>
+            <div style="display:flex;gap:8px">
+              <button class="btn btn-secondary" style="font-size:11px" onclick="resetRespondTemplate(1)">
+                <i class="fa fa-rotate-left"></i> Reset
+              </button>
+              <button class="btn" style="background:#0052cc;color:#fff;border-color:#0052cc;font-size:11px" onclick="saveRespondTemplate(1)">
+                <i class="fa fa-floppy-disk"></i> Save
+              </button>
+            </div>
+          </div>
+          <div style="padding:10px 16px 4px;font-size:11px;color:#555;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+            Insert field:
+            <button onclick="insertTemplateField('[Name]','respondTemplateEditor1')" style="background:#e8f0fe;color:#0052cc;border:1px solid #bed0f7;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600;cursor:pointer">[Name]</button>
+            <button onclick="insertTemplateField('[EntryIDs]','respondTemplateEditor1')" style="background:#e8f0fe;color:#0052cc;border:1px solid #bed0f7;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600;cursor:pointer">[EntryIDs]</button>
+            <button onclick="insertTemplateField('[Signature]','respondTemplateEditor1')" style="background:#e8f0fe;color:#0052cc;border:1px solid #bed0f7;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600;cursor:pointer">[Signature]</button>
+          </div>
+          <div style="padding:6px 16px 14px">
+            <textarea id="respondTemplateEditor1" style="width:100%;height:260px;padding:10px;border:1.5px solid #d0d8e8;border-radius:8px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical;line-height:1.6"></textarea>
+          </div>
+        </div>
+
+        <!-- Template 2: Cannot be Restored -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title"><i class="fa fa-circle-xmark" style="color:#d13438"></i> Template — Cannot be Restored</div>
+            <div style="display:flex;gap:8px">
+              <button class="btn btn-secondary" style="font-size:11px" onclick="resetRespondTemplate(2)">
+                <i class="fa fa-rotate-left"></i> Reset
+              </button>
+              <button class="btn" style="background:#0052cc;color:#fff;border-color:#0052cc;font-size:11px" onclick="saveRespondTemplate(2)">
+                <i class="fa fa-floppy-disk"></i> Save
+              </button>
+            </div>
+          </div>
+          <div style="padding:10px 16px 4px;font-size:11px;color:#555;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+            Insert field:
+            <button onclick="insertTemplateField('[Name]','respondTemplateEditor2')" style="background:#fde8e8;color:#b00;border:1px solid #f5b8b8;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600;cursor:pointer">[Name]</button>
+            <button onclick="insertTemplateField('[EntryIDs]','respondTemplateEditor2')" style="background:#fde8e8;color:#b00;border:1px solid #f5b8b8;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600;cursor:pointer">[EntryIDs]</button>
+            <button onclick="insertTemplateField('[Signature]','respondTemplateEditor2')" style="background:#fde8e8;color:#b00;border:1px solid #f5b8b8;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600;cursor:pointer">[Signature]</button>
+          </div>
+          <div style="padding:6px 16px 14px">
+            <textarea id="respondTemplateEditor2" style="width:100%;height:260px;padding:10px;border:1.5px solid #f5b8b8;border-radius:8px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical;line-height:1.6"></textarea>
+          </div>
+        </div>
+
       </div>
     </div>
   </div>
@@ -1079,7 +1367,17 @@ input:focus,select:focus{border-color:#0078d4;box-shadow:0 0 0 2px rgba(0,120,21
     <div style="font-size:12px;color:#555;margin-bottom:10px">
       Case <strong id="respondCaseNum"></strong> &mdash; <span id="respondContact"></span>
     </div>
-    <textarea id="respondPreview" spellcheck="false" style="width:100%;height:320px;padding:10px 12px;font-size:11px;color:#333;line-height:1.6;border:1px solid #d0d7de;border-radius:6px;resize:vertical;font-family:Segoe UI,Arial,sans-serif;background:#fafbff;outline:none"></textarea>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <button id="respondTplBtn1" onclick="switchRespondTemplate(1)"
+        style="flex:1;padding:7px 10px;border-radius:6px;border:2px solid #2da44e;background:#e6f4ea;color:#1a7f37;font-size:12px;font-weight:600;cursor:pointer">
+        <i class="fa fa-circle-check"></i> Restored
+      </button>
+      <button id="respondTplBtn2" onclick="switchRespondTemplate(2)"
+        style="flex:1;padding:7px 10px;border-radius:6px;border:2px solid #d0d7de;background:#fff;color:#666;font-size:12px;font-weight:600;cursor:pointer">
+        <i class="fa fa-circle-xmark"></i> Cannot be Restored
+      </button>
+    </div>
+    <textarea id="respondPreview" spellcheck="false" style="width:100%;height:300px;padding:10px 12px;font-size:11px;color:#333;line-height:1.6;border:1px solid #d0d7de;border-radius:6px;resize:vertical;font-family:Segoe UI,Arial,sans-serif;background:#fafbff;outline:none"></textarea>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal('respondModal')">Cancel</button>
       <button class="btn" style="background:#2da44e;color:#fff" id="respondConfirmBtn" onclick="confirmRespond()">
@@ -1383,11 +1681,40 @@ function toast(msg, type='info') {
   setTimeout(() => div.remove(), 4000);
 }
 
+// ── Kaltura Admin connection status ───────────────────────────────────────────
+async function checkKalturaAdminStatus() {
+  const el = document.getElementById('kalturaAdminStatus');
+  if (!el) return;
+  try {
+    const res = await fetch('/api/kaltura-status');
+    const { connected } = await res.json();
+    if (connected) {
+      el.innerHTML = '<span style="display:inline-flex;align-items:center;gap:6px;padding:6px 14px;background:#e6f4ea;color:#1a7f37;border:1px solid #2da44e;border-radius:8px;font-size:12px;font-weight:600">' +
+        '<i class="fa fa-circle-check"></i> Kaltura Admin Connected' +
+        '<button onclick="disconnectKalturaAdmin()" style="margin-left:8px;background:none;border:none;color:#888;cursor:pointer;font-size:11px;padding:0" title="Disconnect"><i class="fa fa-xmark"></i></button>' +
+        '</span>';
+    } else {
+      el.innerHTML = '<a href="http://localhost:3737/kaltura-cookie-capture" target="_blank" onmousedown="setTimeout(checkKalturaAdminStatus,3000)"' +
+        ' style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#fff3cd;color:#7d5500;border:1px solid #f0c040;border-radius:8px;font-size:12px;font-weight:600;text-decoration:none;cursor:pointer"' +
+        ' title="One-time setup required for Restore buttons to work">' +
+        '<i class="fa fa-key"></i> Connect Kaltura Admin</a>';
+    }
+  } catch(e) { /* silent */ }
+}
+
+async function disconnectKalturaAdmin() {
+  await fetch('/api/kaltura-disconnect', { method: 'POST' });
+  checkKalturaAdminStatus();
+  toast('Kaltura Admin disconnected', 'info');
+}
+
 // ── Tab switching ─────────────────────────────────────────────────────────────
 function switchTab(tab) {
-  ['report','handling','dashboard','jpmc','settings'].forEach(t => {
-    document.getElementById('page-' + t).style.display = t === tab ? '' : 'none';
-    document.getElementById('tab-' + t).classList.toggle('active', t === tab);
+  ['report','handling','dashboard','jpmc','general','settings'].forEach(t => {
+    const pg = document.getElementById('page-' + t);
+    const tb = document.getElementById('tab-' + t);
+    if (pg) pg.style.display = t === tab ? '' : 'none';
+    if (tb) tb.classList.toggle('active', t === tab);
   });
   if (tab === 'handling' && !chLoaded) loadCaseHandling();
   if (tab === 'settings') loadSettingsTab();
@@ -1397,9 +1724,15 @@ function switchTab(tab) {
       const savedMs = getJpmcRefreshInterval();
       if (savedMs > 0) setJpmcSchedule(savedMs);
     }
+    checkKalturaAdminStatus();
     if (!jpmcLoaded) loadJpmcCases();
     if (!jpmcNewLoaded) loadJpmcNewCases();
     if (!_jpmcStats) loadJpmcStats();
+  }
+  if (tab === 'general') {
+    if (!_generalStats) loadGeneralStats();
+    if (!generalLoaded) loadGeneralCases();
+    if (!generalNewLoaded) loadGeneralNewCases();
   }
   if (tab === 'dashboard') initDashboard();
 }
@@ -1416,6 +1749,20 @@ function toggleJpmcSection(section) {
   // If expanding stats and chart exists, re-render it
   if (section === 'stats' && !isCollapsed && _jpmcStats) {
     setTimeout(() => renderJpmcStatsChart(_jpmcStatsPeriod), 50);
+  }
+}
+
+// ── General Section collapse ──────────────────────────────────────────────────
+function toggleGeneralSection(section) {
+  const bodyId = { stats: 'generalStatsBody', restore: 'generalRestoreBody', open: 'generalOpenBody' }[section];
+  const btnId  = { stats: 'collapse-general-stats', restore: 'collapse-general-restore', open: 'collapse-general-open' }[section];
+  const body = document.getElementById(bodyId);
+  const btn  = document.getElementById(btnId);
+  if (!body) return;
+  const isCollapsed = body.classList.toggle('collapsed');
+  if (btn) btn.classList.toggle('collapsed', isCollapsed);
+  if (section === 'stats' && !isCollapsed && _generalStats) {
+    setTimeout(() => renderGeneralStatsChart(_generalStatsPeriod), 50);
   }
 }
 
@@ -1577,7 +1924,7 @@ function renderJpmcCases() {
     tableHtml = '<div style="padding:48px;text-align:center;color:#aaa"><i class="fa fa-circle-check" style="font-size:36px;display:block;margin-bottom:12px;color:#2da44e"></i>No unassigned cases</div>';
   } else {
     tableHtml = \`<table><thead><tr>
-      <th>Case #</th><th>Subject</th><th>Contact</th><th>Created</th><th>Assign To</th>
+      <th>Case #</th><th>Subject</th><th>Contact</th><th>Created</th><th>Assign To</th><th>Restore</th>
     </tr></thead><tbody>\`;
     cases.forEach((c, i) => {
       const _cd = (c.CreatedDate || '').replace('+0000', 'Z');
@@ -1599,6 +1946,9 @@ function renderJpmcCases() {
             <i class="fa fa-user-plus"></i> Assign <i class="fa fa-chevron-down" style="font-size:9px"></i>
           </button>
           <div class="assign-picker" id="assignPicker-\${i}" style="display:none"></div>
+        </td>
+        <td style="white-space:nowrap">
+          \${kEntry ? '<button class="assign-btn" style="background:#e8f0fe;color:#0052cc;border-color:#0052cc" data-kid="' + kEntry.replace(/"/g,'') + '" onclick="restoreKalturaEntry(event,this.dataset.kid)"><i class="fa fa-rotate-left"></i> Restore</button>' : '<span style="color:#aaa;font-size:11px">—</span>'}
         </td>
       </tr>\`;
     });
@@ -1744,27 +2094,73 @@ async function loadSFUserForTemplate() {
   }
 }
 
-function buildTemplateText(firstName, kalturaId) {
-  const n = String.fromCharCode(10);
-  const name  = (firstName || '[Contact Name]');
-  const sigName = _sfUser ? _sfUser.name : '[Your Name]';
-  const entryLine = kalturaId && kalturaId !== '-' ? 'Entry ID(s): ' + kalturaId + n + n : '';
-  return 'Hi ' + name + ',' + n + n +
-    'Thanks for reaching out to Kaltura Customer Care.' + n + n +
-    entryLine +
-    "I'm happy to confirm that the requested entries have been successfully restored. Please check on your end and let us know if everything looks good." + n + n +
-    'Please note that restore requests are handled on a best effort basis.' + n + n +
-    'I will now be marking the case as closed.' + n + n +
-    'Should you notice anything else or need further assistance, feel free to reach out.' + n + n +
-    'Best regards,' + n + n +
-    sigName + n +
-    'Kaltura Customer Care | Kaltura Inc.' + n +
-    'Support: https://support.kaltura.com' + n + n +
-    'Knowledge Base: https://knowledge.kaltura.com' + n +
-    'Website: https://www.kaltura.com' + n +
-    'Status Alerts: https://status.kaltura.com' + n + n +
-    'Get your support questions answered before login \u2014 try our AI Support Assistant in the bottom left corner!' + n + n +
-    'The age of Agentic Avatars is here: https://corp.kaltura.com/agentic-avatars/';
+const DEFAULT_RESPOND_TEMPLATE = \`Hi [Name],
+
+Thanks for reaching out to Kaltura Customer Care regarding your video recovery request.
+
+I'm happy to confirm that the requested entry(ies) have been successfully restored:
+[EntryIDs]
+Please note that restore requests are handled on a best-effort basis.
+
+I will proceed with closing this case for now. If you need further assistance, please don't hesitate to reach out.
+
+Best regards,
+
+[Signature]
+Kaltura Customer Care | Kaltura Inc.
+Support: https://support.kaltura.com
+
+Knowledge Base: https://knowledge.kaltura.com
+Website: https://www.kaltura.com
+Status Alerts: https://status.kaltura.com
+
+Get your support questions answered before login — try our AI Support Assistant in the bottom left corner!
+
+The age of Agentic Avatars is here: https://corp.kaltura.com/agentic-avatars/\`;
+
+const DEFAULT_RESPOND_TEMPLATE_2 = \`Hi [Name],
+
+Thanks for reaching out to Kaltura Customer Care regarding your video recovery request.
+
+We know how important this content is and made every effort to restore the requested entry(ies). Unfortunately, the entry(ies) below could not be recovered:
+
+Entry ID(s): [EntryIDs]
+
+Please note that recovery requests are handled on a best-effort basis. We appreciate your understanding.
+
+I will proceed with closing this case for now. If you need further assistance, please don't hesitate to reach out.
+
+Best regards,
+
+[Signature]
+Kaltura Customer Care | Kaltura Inc.
+Support: https://support.kaltura.com
+
+Knowledge Base: https://knowledge.kaltura.com
+Website: https://www.kaltura.com
+Status Alerts: https://status.kaltura.com
+
+Get your support questions answered before login — try our AI Support Assistant in the bottom left corner!
+
+The age of Agentic Avatars is here: https://corp.kaltura.com/agentic-avatars/\`;
+
+function getRespondTemplate(n) {
+  if (n === 2) return localStorage.getItem('respondTemplate2') || DEFAULT_RESPOND_TEMPLATE_2;
+  return localStorage.getItem('respondTemplate1') || DEFAULT_RESPOND_TEMPLATE;
+}
+
+function applyTemplateVars(tpl, firstName, kalturaId) {
+  const name     = firstName || 'there';
+  const sigName  = _sfUser ? _sfUser.name : '[Your Name]';
+  const entryLine = (kalturaId && kalturaId !== '-') ? kalturaId : '';
+  return tpl
+    .replace(/\\[Name\\]/g, name)
+    .replace(/\\[EntryIDs\\]/g, entryLine)
+    .replace(/\\[Signature\\]/g, sigName);
+}
+
+function buildTemplateText(firstName, kalturaId, tplNum) {
+  return applyTemplateVars(getRespondTemplate(tplNum || 1), firstName, kalturaId);
 }
 
 function previewTemplate(firstName, kalturaId) {
@@ -1779,6 +2175,36 @@ function pickEvenAssignee() {
   const minCount = Math.min(...pool.map(u => jpmcAssignCounts[u.id] || 0));
   const candidates = pool.filter(u => (jpmcAssignCounts[u.id] || 0) === minCount);
   return candidates[Math.floor(Math.random() * candidates.length)];
+}
+
+function restoreKalturaEntry(evt, entryIds) {
+  evt.stopPropagation();
+  if (!entryIds) return;
+  const btn = evt.currentTarget || evt.target;
+  const origHtml = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fa fa-spinner fa-spin"></i> Restoring…'; }
+
+  fetch('http://localhost:3737/api/kaltura-restore', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entryId: entryIds })
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (btn) { btn.disabled = false; btn.innerHTML = origHtml; }
+    if (data.ok) {
+      const ids = (data.results || []).map(r => r.id).join(', ');
+      toast('✓ Restored: ' + ids, 'success');
+      if (btn) { btn.innerHTML = '<i class="fa fa-check"></i> Restored'; btn.style.background = '#e6f4ea'; btn.style.color = '#1a7f37'; btn.style.borderColor = '#2da44e'; }
+    } else {
+      const errs = (data.results || []).filter(r => !r.success).map(r => r.id + ': ' + r.message).join('; ');
+      toast('✗ Restore failed — ' + (errs || data.error || 'unknown error'), 'error');
+    }
+  })
+  .catch(e => {
+    if (btn) { btn.disabled = false; btn.innerHTML = origHtml; }
+    toast('✗ Server error: ' + e.message, 'error');
+  });
 }
 
 function toggleAssignPicker(evt, idx, caseId) {
@@ -1831,6 +2257,7 @@ async function doJpmcPickAssign(evt, el) {
     setTimeout(() => {
       const row = document.getElementById('jpmc-row-' + idx);
       if (row) { row.style.transition = 'opacity .4s'; row.style.opacity = '0.3'; }
+      loadJpmcNewCases();
     }, 1500);
   } catch(err) {
     btn.disabled = false;
@@ -1911,6 +2338,7 @@ async function assignAllJpmcCases() {
       document.querySelectorAll('[id^="jpmc-row-"]').forEach(row => {
         row.style.transition = 'opacity .4s'; row.style.opacity = '0.3';
       });
+      loadJpmcNewCases();
     }, 1500);
   }
 }
@@ -1975,13 +2403,16 @@ function renderJpmcNewRows(cases) {
         '<td>' + statusBadge + '</td>' +
         '<td style="white-space:nowrap;font-size:11px;color:#888">' + created + '</td>' +
         '<td style="white-space:nowrap"><button class="respond-btn" id="respondBtn-new-' + i + '"' +
-        ' data-cid="' + c.Id + '" data-cnum="' + esc(c.CaseNumber) + '" data-fname="' + firstName + '" data-contact="' + contact + '" data-btnid="respondBtn-new-' + i + '"' +
+        ' data-cid="' + c.Id + '" data-cnum="' + esc(c.CaseNumber) + '" data-fname="' + firstName + '" data-contact="' + contact + '" data-kid="' + esc(kalturaId !== '-' ? kalturaId : '') + '" data-btnid="respondBtn-new-' + i + '"' +
         ' onclick="openRespondModalFromBtn(this)"><i class="fa fa-reply"></i> Respond</button></td>' +
+        '<td style="white-space:nowrap">' + (kalturaId !== '-'
+          ? '<button class="respond-btn" style="background:#e8f0fe;color:#0052cc;border-color:#0052cc" data-kid="' + kalturaId.replace(/"/g,'') + '" onclick="restoreKalturaEntry(event,this.dataset.kid)"><i class="fa fa-rotate-left"></i> Restore</button>'
+          : '<span style="color:#aaa;font-size:11px">—</span>') + '</td>' +
         '</tr>';
     }).join('');
     content.innerHTML = '<table><thead><tr>' +
       '<th>Case #</th><th>Subject</th><th>Contact</th>' +
-      '<th>Kaltura Entry ID</th><th>Owner</th><th>Status</th><th>Created</th><th>Respond</th>' +
+      '<th>Kaltura Entry ID</th><th>Assigned To</th><th>Status</th><th>Created</th><th>Respond</th><th>Restore</th>' +
       '</tr></thead><tbody>' + rows + '</tbody></table>';
   }
   content.style.display = '';
@@ -2013,46 +2444,18 @@ async function loadJpmcNewCases() {
 
 // ── Respond modal ─────────────────────────────────────────────────────────────
 let _respondState = null;
-const RESPOND_TEMPLATE = (name) => \`Hi \${name || 'there'},
-
-Thanks for reaching out to Kaltura Customer Care.
-
-I'm happy to confirm that the requested entries have been successfully restored. Please check on your end and let us know if everything looks good.
-
-Please note that restore requests are handled on a best effort basis.
-
-I will now be marking the case as closed.
-
-Should you notice anything else or need further assistance, feel free to reach out.
-
-Best regards,
-
-\${_sfUser ? _sfUser.name : '[Your Name]'}
-Kaltura Customer Care | Kaltura Inc.
-Support: https://support.kaltura.com
-
-Knowledge Base: https://knowledge.kaltura.com
-Website: https://www.kaltura.com
-Status Alerts: https://status.kaltura.com
-
-Get your support questions answered before login — try our AI Support Assistant in the bottom left corner!
-
-The age of Agentic Avatars is here: https://corp.kaltura.com/agentic-avatars/\`;
 
 function openRespondModalFromBtn(el) {
-  openRespondModal(el.dataset.cid, el.dataset.cnum, el.dataset.fname, el.dataset.contact, el.id);
+  openRespondModal(el.dataset.cid, el.dataset.cnum, el.dataset.fname, el.dataset.contact, el.dataset.kid || '', el.id);
 }
 
-function openRespondModal(caseId, caseNum, firstName, contactName, btnId) {
-  _respondState = { caseId, caseNum, firstName, btnId };
+async function openRespondModal(caseId, caseNum, firstName, contactName, kalturaId, btnId) {
+  if (!_sfUser) await loadSFUserForTemplate();
+  _respondState = { caseId, caseNum, firstName, kalturaId: kalturaId || '', btnId };
   document.getElementById('respondCaseNum').textContent = caseNum;
   document.getElementById('respondContact').textContent = contactName;
-  // Use text from the editable template card if available, else build fresh
-  const tplCard = document.getElementById('templatePreview');
-  const tplText = (tplCard && tplCard.value && tplCard.value !== 'Hover a case row to preview...')
-    ? tplCard.value
-    : buildTemplateText(firstName, '');
-  document.getElementById('respondPreview').value = tplText;
+  // Default to Template 1 (Restored) on open
+  switchRespondTemplate(1);
   const btn = document.getElementById('respondConfirmBtn');
   btn.disabled = false;
   btn.innerHTML = '<i class="fa fa-paper-plane"></i> Send & Close Case';
@@ -2076,20 +2479,258 @@ async function confirmRespond() {
     if (!res.ok) throw new Error(await res.text());
     closeModal('respondModal');
     toast('Response sent and case closed', 'success');
-    // Mark the button as done
+    // Mark the button as done and fade the row
     const btn = document.getElementById(btnId);
     if (btn) {
       btn.className = 'respond-btn done';
       btn.innerHTML = '<i class="fa fa-circle-check"></i> Sent';
       btn.disabled = true;
-      // Fade the row
       const row = btn.closest('tr');
       if (row) { row.style.transition = 'opacity .4s'; row.style.opacity = '0.35'; }
     }
+    // Refresh the list so closed case disappears
+    setTimeout(() => loadJpmcNewCases(), 1500);
   } catch(err) {
     confirmBtn.disabled = false;
     confirmBtn.innerHTML = '<i class="fa fa-paper-plane"></i> Send & Close Case';
     toast('Error: ' + err.message, 'error');
+  }
+}
+
+// ── General Restore Tab ───────────────────────────────────────────────────────
+let _generalStats = null;
+let _generalStatsPeriod = 'day7';
+let _generalStatsChart = null;
+
+async function loadGeneralStats() {
+  const loader  = document.getElementById('generalStatsLoader');
+  const content = document.getElementById('generalStatsContent');
+  if (!loader) return;
+  loader.style.display = 'flex'; content.style.display = 'none';
+  try {
+    const res = await fetch('/api/general-stats');
+    if (!res.ok) throw new Error(await res.text());
+    _generalStats = await res.json();
+    const restore  = _generalStats.total;
+    const totalAll = _generalStats.totalAll || restore;
+    const nonRestore = Math.max(0, totalAll - restore);
+    const restorePct = totalAll > 0 ? Math.round(restore / totalAll * 100) : 0;
+    document.getElementById('generalStatTotal').textContent    = restore;
+    document.getElementById('generalStatTotalAll').textContent = nonRestore;
+    document.getElementById('generalStatRestorePct').textContent    = restorePct + '%';
+    document.getElementById('generalStatNonRestorePct').textContent = (100 - restorePct) + '%';
+    document.getElementById('generalStatTotalBadge').textContent    = restore + ' YTD';
+    loader.style.display = 'none'; content.style.display = '';
+    renderGeneralStatsChart(_generalStatsPeriod);
+  } catch(e) {
+    loader.innerHTML = '<span style="color:#b00">Error: ' + e.message + '</span>';
+  }
+}
+
+function setGeneralStatsPeriod(period) {
+  ['day7','day30','day90','weekly','monthly'].forEach(p => {
+    const map = { day7:'Day7', day30:'Day30', day90:'Day90', weekly:'Week', monthly:'Month' };
+    const btn = document.getElementById('generalStatsBtn' + map[p]);
+    if (btn) btn.classList.toggle('active', p === period);
+  });
+  _generalStatsPeriod = period;
+  if (_generalStats) renderGeneralStatsChart(period);
+}
+
+function renderGeneralStatsChart(period) {
+  if (!_generalStats) return;
+  let labels, values;
+  if (period === 'day7' || period === 'day30' || period === 'day90') {
+    const days = period === 'day7' ? 7 : period === 'day30' ? 30 : 90;
+    const allDays = Object.keys(_generalStats.daily).sort();
+    const cutoff = Array.from({length: days}, (_, i) => {
+      const d = new Date(); d.setDate(d.getDate() - (days - 1 - i));
+      return d.toISOString().slice(0, 10);
+    });
+    labels = cutoff.map(k => k.slice(5));
+    values = cutoff.map(k => _generalStats.daily[k] || 0);
+  } else {
+    const data = _generalStats[period];
+    labels = Object.keys(data).sort();
+    values = labels.map(k => data[k]);
+  }
+  if (_generalStatsChart) { _generalStatsChart.destroy(); _generalStatsChart = null; }
+  const ctx = document.getElementById('generalStatsChart');
+  if (!ctx) return;
+  _generalStatsChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{ label: 'Restore Requests', data: values,
+        backgroundColor: 'rgba(0,120,212,0.7)', borderColor: '#0078d4',
+        borderWidth: 1, borderRadius: 4 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false },
+        datalabels: { display: ctx2 => ctx2.dataset.data[ctx2.dataIndex] > 0,
+          color: '#0052cc', font: { size: 10, weight: 700 }, anchor: 'end', align: 'top' }
+      },
+      scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } }
+    }
+  });
+}
+
+// ── General Entry Restore Requests (unassigned new) ───────────────────────────
+let _generalRaw = [];
+let generalLoaded = false;
+
+async function loadGeneralCases() {
+  const loader  = document.getElementById('generalLoader');
+  const content = document.getElementById('generalContent');
+  const badge   = document.getElementById('generalRestoreBadge');
+  if (!loader || !content) return;
+  loader.style.display = 'flex'; content.innerHTML = '';
+  try {
+    const res = await fetch('/api/general-cases');
+    if (!res.ok) throw new Error(await res.text());
+    const { cases } = await res.json();
+    _generalRaw = cases;
+    generalLoaded = true;
+    if (badge) badge.textContent = cases.length + ' case' + (cases.length !== 1 ? 's' : '');
+    renderGeneralCases(cases);
+  } catch(err) {
+    content.innerHTML = '<div style="padding:24px;color:#b00">' + err.message + '</div>';
+  } finally { loader.style.display = 'none'; }
+}
+
+function renderGeneralCases(cases) {
+  const content = document.getElementById('generalContent');
+  if (!content) return;
+  const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  if (!cases.length) {
+    content.innerHTML = '<div style="padding:48px;text-align:center;color:#aaa"><i class="fa fa-circle-check" style="font-size:40px;display:block;margin-bottom:12px;color:#2da44e"></i>No unassigned restore requests right now</div>';
+    return;
+  }
+  let rows = cases.map((c, i) => {
+    const _cd = (c.CreatedDate || '').replace('+0000', 'Z');
+    const created = isNaN(new Date(_cd).getTime()) ? (c.CreatedDate || '—') : new Date(_cd).toLocaleString();
+    const contact   = esc(c['Contact.Name'] || c['Contact.Email'] || '—');
+    const firstName = esc(c['Contact.FirstName'] || '');
+    const account   = esc(c['Account.Name'] || '—');
+    const rawDesc   = (c.Description || '').trim();
+    const allMatches = rawDesc.match(/[01]_[a-z0-9]+/gi) || [];
+    const kalturaId  = allMatches.length ? [...new Set(allMatches)].join(', ') : '-';
+    const sfUrl = 'https://kaltura.lightning.force.com/lightning/r/Case/' + c.Id + '/view';
+    return '<tr>' +
+      '<td><a href="' + sfUrl + '" target="_blank" style="color:#0078d4;font-weight:700;text-decoration:none">' + esc(c.CaseNumber) + '</a></td>' +
+      '<td>' + esc(c.Subject) + '</td>' +
+      '<td>' + account + '</td>' +
+      '<td>' + contact + '</td>' +
+      '<td><span style="font-family:monospace;font-size:12px;font-weight:700;color:#0052cc;background:#e8f0fe;padding:2px 8px;border-radius:6px">' + esc(kalturaId) + '</span></td>' +
+      '<td style="white-space:nowrap;font-size:11px;color:#888">' + created + '</td>' +
+      '<td style="white-space:nowrap"><button class="respond-btn"' +
+      ' data-cid="' + c.Id + '" data-cnum="' + esc(c.CaseNumber) + '" data-fname="' + firstName + '" data-contact="' + contact + '" data-btnid="generalRespondBtn-' + i + '" id="generalRespondBtn-' + i + '"' +
+      ' onclick="openRespondModalFromBtn(this)"><i class="fa fa-reply"></i> Respond</button></td>' +
+      '</tr>';
+  }).join('');
+  content.innerHTML = '<div class="tbl-wrap"><table><thead><tr>' +
+    '<th>Case #</th><th>Subject</th><th>Account</th><th>Contact</th>' +
+    '<th>Kaltura Entry ID</th><th>Created</th><th>Respond</th>' +
+    '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+}
+
+// ── General All Open Cases (categorized) ─────────────────────────────────────
+let _generalNewRaw = [];
+let generalNewLoaded = false;
+
+function categorizeGeneralCase(c) {
+  const s = (c.Subject || '').toLowerCase();
+  if (s.includes('channel') || s.includes('categor') || s.includes('gallerr') ||
+      s.includes('galleries') || s.includes('gallery') || s.includes('playlist')) return 'channels';
+  if (s.includes('user') || s.includes('admin account') || s.includes('member')) return 'users';
+  return 'entries';
+}
+
+function filterGeneralNewCases() {
+  const sel = document.getElementById('generalNewStatusFilter');
+  const filter = sel ? sel.value : 'all';
+  const cases = filter === 'all' ? _generalNewRaw : _generalNewRaw.filter(c => c.Status === filter);
+  const badge = document.getElementById('generalNewBadge');
+  if (badge) badge.textContent = cases.length + ' case' + (cases.length !== 1 ? 's' : '');
+  renderGeneralNewRows(cases);
+}
+
+function renderGeneralNewRows(cases) {
+  const content = document.getElementById('generalNewContent');
+  if (!content) return;
+  const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+  const entries  = cases.filter(c => categorizeGeneralCase(c) === 'entries');
+  const channels = cases.filter(c => categorizeGeneralCase(c) === 'channels');
+  const users    = cases.filter(c => categorizeGeneralCase(c) === 'users');
+
+  const statusColor = s => {
+    const l = (s||'').toLowerCase();
+    if (l === 'new') return '#b00020';
+    if (l.includes('customer responded') || l.includes('review')) return '#e65c00';
+    if (l.includes('awaiting')) return '#0052cc';
+    if (l === 'resolved') return '#2da44e';
+    return '#555';
+  };
+
+  const buildTable = (rows) => {
+    if (!rows.length) return '<div style="padding:20px;text-align:center;color:#aaa;font-size:12px">No cases in this category</div>';
+    const trs = rows.map((c, i) => {
+      const _cd = (c.CreatedDate || '').replace('+0000', 'Z');
+      const created  = isNaN(new Date(_cd).getTime()) ? (c.CreatedDate || '—') : new Date(_cd).toLocaleString();
+      const contact  = esc(c['Contact.Name'] || c['Contact.Email'] || '—');
+      const account  = esc(c['Account.Name'] || '—');
+      const owner    = esc(c['Assigned_To__r.Name'] || c['Owner.Name'] || '—');
+      const sfUrl    = 'https://kaltura.lightning.force.com/lightning/r/Case/' + c.Id + '/view';
+      const statusBadge = '<span style="font-size:10px;font-weight:700;color:' + statusColor(c.Status) + ';background:#f8f9ff;border:1px solid currentColor;padding:1px 6px;border-radius:10px;white-space:nowrap">' + esc(c.Status) + '</span>';
+      return '<tr>' +
+        '<td><a href="' + sfUrl + '" target="_blank" style="color:#0078d4;font-weight:700;text-decoration:none">' + esc(c.CaseNumber) + '</a></td>' +
+        '<td>' + esc(c.Subject) + '</td>' +
+        '<td>' + account + '</td>' +
+        '<td>' + contact + '</td>' +
+        '<td>' + owner + '</td>' +
+        '<td>' + statusBadge + '</td>' +
+        '<td style="white-space:nowrap;font-size:11px;color:#888">' + created + '</td>' +
+        '</tr>';
+    }).join('');
+    return '<div class="tbl-wrap"><table><thead><tr><th>Case #</th><th>Subject</th><th>Account</th><th>Contact</th><th>Owner</th><th>Status</th><th>Created</th></tr></thead><tbody>' + trs + '</tbody></table></div>';
+  };
+
+  const section = (title, icon, color, rows) =>
+    '<div style="margin-bottom:20px">' +
+    '<div class="jpmc-section-divider" style="margin:0 0 8px;font-size:11px">' +
+    '<i class="fa ' + icon + '" style="color:' + color + '"></i> ' + title +
+    ' <span class="badge badge-blue" style="margin-left:4px">' + rows.length + '</span>' +
+    '</div>' +
+    buildTable(rows) +
+    '</div>';
+
+  content.innerHTML =
+    section('Entries / Videos', 'fa-film', '#0078d4', entries) +
+    section('Channels / Categories / Galleries', 'fa-layer-group', '#7c4dff', channels) +
+    section('Users', 'fa-users', '#e65c00', users);
+  content.style.display = '';
+}
+
+async function loadGeneralNewCases() {
+  const loader  = document.getElementById('generalNewLoader');
+  const content = document.getElementById('generalNewContent');
+  const badge   = document.getElementById('generalNewBadge');
+  if (!loader || !content) return;
+  loader.style.display = 'flex'; content.style.display = 'none';
+  try {
+    const res = await fetch('/api/general-new-cases');
+    if (!res.ok) throw new Error(await res.text());
+    _generalNewRaw = await res.json();
+    generalNewLoaded = true;
+    filterGeneralNewCases();
+    loader.style.display = 'none';
+  } catch(err) {
+    if (badge) badge.textContent = 'Error';
+    loader.style.display = 'none';
+    content.innerHTML = '<div style="padding:24px;color:#b00">' + err.message + '</div>';
+    content.style.display = '';
   }
 }
 
@@ -2441,6 +3082,7 @@ function showCases(idx, period) {
 dashPinned.forEach(id => updatePinButton(id, true));
 
 loadData();
+loadSFUserForTemplate();
 
 // ── Settings Tab ──────────────────────────────────────────────────────────────
 // teamMembers: [{name, id}]  (id may be null if SF lookup not yet run)
@@ -2448,6 +3090,48 @@ let settingsTeamMembers = null;
 let settingsLoaded = false;
 let settingsSearchTimer = null;
 let _settingsSearchUsers = [];
+
+function saveRespondTemplate(n) {
+  const id = n === 2 ? 'respondTemplateEditor2' : 'respondTemplateEditor1';
+  const val = (document.getElementById(id) || {}).value;
+  if (!val) return;
+  localStorage.setItem(n === 2 ? 'respondTemplate2' : 'respondTemplate1', val);
+  toast('Template ' + (n === 2 ? '2' : '1') + ' saved', 'success');
+}
+
+function resetRespondTemplate(n) {
+  const key = n === 2 ? 'respondTemplate2' : 'respondTemplate1';
+  const def = n === 2 ? DEFAULT_RESPOND_TEMPLATE_2 : DEFAULT_RESPOND_TEMPLATE;
+  const id  = n === 2 ? 'respondTemplateEditor2' : 'respondTemplateEditor1';
+  localStorage.removeItem(key);
+  const el = document.getElementById(id);
+  if (el) el.value = def;
+  toast('Template ' + (n === 2 ? '2' : '1') + ' reset to default', 'success');
+}
+
+function insertTemplateField(field, editorId) {
+  const el = document.getElementById(editorId || 'respondTemplateEditor1');
+  if (!el) return;
+  const start = el.selectionStart, end = el.selectionEnd;
+  el.value = el.value.slice(0, start) + field + el.value.slice(end);
+  el.selectionStart = el.selectionEnd = start + field.length;
+  el.focus();
+}
+
+function switchRespondTemplate(n) {
+  if (!_respondState) return;
+  const { firstName, kalturaId } = _respondState;
+  document.getElementById('respondPreview').value = buildTemplateText(firstName, kalturaId, n);
+  const btn1 = document.getElementById('respondTplBtn1');
+  const btn2 = document.getElementById('respondTplBtn2');
+  if (n === 1) {
+    btn1.style.cssText = 'flex:1;padding:7px 10px;border-radius:6px;border:2px solid #2da44e;background:#e6f4ea;color:#1a7f37;font-size:12px;font-weight:600;cursor:pointer';
+    btn2.style.cssText = 'flex:1;padding:7px 10px;border-radius:6px;border:2px solid #d0d7de;background:#fff;color:#666;font-size:12px;font-weight:600;cursor:pointer';
+  } else {
+    btn1.style.cssText = 'flex:1;padding:7px 10px;border-radius:6px;border:2px solid #d0d7de;background:#fff;color:#666;font-size:12px;font-weight:600;cursor:pointer';
+    btn2.style.cssText = 'flex:1;padding:7px 10px;border-radius:6px;border:2px solid #d13438;background:#fde8e8;color:#b00;font-size:12px;font-weight:600;cursor:pointer';
+  }
+}
 
 async function loadSettingsTab() {
   if (settingsLoaded) return;
@@ -2457,6 +3141,11 @@ async function loadSettingsTab() {
     // data.teamMembers = [{name, id}]
     settingsTeamMembers = data.teamMembers || (data.teamNames || []).map(n => ({ name: n, id: null }));
     renderSettingsTeamList();
+    // Populate respond template editors
+    const tplEl1 = document.getElementById('respondTemplateEditor1');
+    if (tplEl1) tplEl1.value = getRespondTemplate(1);
+    const tplEl2 = document.getElementById('respondTemplateEditor2');
+    if (tplEl2) tplEl2.value = getRespondTemplate(2);
     settingsLoaded = true;
   } catch(e) {
     toast('Failed to load settings: ' + e.message, 'error');
@@ -2575,6 +3264,176 @@ async function saveSettings() {
 </body></html>`;
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
+// ── QA Random Case ────────────────────────────────────────────────────────────
+// Returns a randomly selected case from the last 7 days for a random team member,
+// including the last customer comment and last agent comment.
+function queryQaRandomCase(params) {
+  return new Promise((resolve, reject) => {
+    const nameClause = TEAM_NAMES.map(n => `'${n}'`).join(',');
+    // Query cases created in last 7 days — use explicit ISO date to avoid LAST_N_DAYS caching issues
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const soql = `SELECT Id, CaseNumber, Subject, Status, Origin, Owner.Name, LastModifiedDate, CreatedDate, Description FROM Case WHERE Owner.Name IN (${nameClause}) AND CreatedDate >= ${sevenDaysAgo} ORDER BY CreatedDate DESC LIMIT 2000`;
+    const tmpSoql = path.join(os.tmpdir(), 'sf_qa_cases.soql');
+    const tmpCsv  = path.join(os.tmpdir(), 'sf_qa_cases.csv');
+    // Delete stale CSV before querying to prevent reading old cached results
+    try { fs.unlinkSync(tmpCsv); } catch(e) {}
+    fs.writeFileSync(tmpSoql, soql, 'utf8');
+    execFile('powershell', [
+      '-Command',
+      `& '${SF_CMD}' data query --target-org ${SF_ORG} --result-format csv --file '${tmpSoql}' --output-file '${tmpCsv}'; exit 0`
+    ], { maxBuffer: 20 * 1024 * 1024, timeout: 60000 }, (err, stdout, stderr) => {
+      try {
+        if (!fs.existsSync(tmpCsv)) return reject(new Error('SF query produced no output — check SF CLI connection'));
+        const raw = fs.readFileSync(tmpCsv, 'utf8');
+        const lines = raw.split(/\r?\n/).filter(Boolean);
+        const cases = parseCSVGeneric(lines);
+        if (!cases.length) return reject(new Error(`No cases found created since ${sevenDaysAgo.slice(0,10)} for team members`));
+
+        // Group by agent name
+        const byAgent = {};
+        cases.forEach(c => {
+          const owner = (DISPLAY[c['Owner.Name']] || c['Owner.Name'] || '').trim();
+          if (!owner) return;
+          if (!byAgent[owner]) byAgent[owner] = [];
+          byAgent[owner].push(c);
+        });
+        const agentNames = Object.keys(byAgent);
+        if (!agentNames.length) return reject(new Error('No cases found'));
+
+        // Pick random agent, then random case
+        const agentName = agentNames[Math.floor(Math.random() * agentNames.length)];
+        const pool = byAgent[agentName];
+        const picked = pool[Math.floor(Math.random() * pool.length)];
+        const caseId = picked.Id;
+        const caseNumber = picked.CaseNumber;
+
+        // Query CaseComments using JSON format — avoids CSV multiline parsing issues
+        const commentSoql = `SELECT CommentBody, CreatedBy.Name, CreatedDate FROM CaseComment WHERE ParentId = '${caseId}' AND IsPublished = true ORDER BY CreatedDate ASC LIMIT 500`;
+        const tmpCSoql = path.join(os.tmpdir(), 'sf_qa_cc.soql');
+        const tmpCJson = path.join(os.tmpdir(), 'sf_qa_cc.json');
+        try { fs.unlinkSync(tmpCJson); } catch(e) {}
+        fs.writeFileSync(tmpCSoql, commentSoql, 'utf8');
+        execFile('powershell', [
+          '-Command',
+          `& '${SF_CMD}' data query --target-org ${SF_ORG} --result-format json --file '${tmpCSoql}' --output-file '${tmpCJson}'; exit 0`
+        ], { maxBuffer: 10 * 1024 * 1024, timeout: 30000 }, (err2) => {
+          let customerMsg = '';
+          let agentMsg = '';
+          const ownerSfName = (picked['Owner.Name'] || '').trim().toLowerCase();
+
+          // Parse CaseComments from JSON — reliable for multiline comment bodies
+          try {
+            const json = JSON.parse(fs.readFileSync(tmpCJson, 'utf8'));
+            const comments = (json.result && json.result.records) ? json.result.records : [];
+            for (let i = comments.length - 1; i >= 0; i--) {
+              const c = comments[i];
+              const body = (c.CommentBody || '').trim();
+              if (!body) continue;
+              // Skip Salesforce auto-generated email threading tokens
+              if (/^\[\s*ref:[A-Za-z0-9]+:ref\s*\]$/.test(body)) continue;
+              const author = (c.CreatedBy && c.CreatedBy.Name ? c.CreatedBy.Name : c['CreatedBy.Name'] || '').trim().toLowerCase();
+              const isOwner = author === ownerSfName;
+              if (!agentMsg    && isOwner)  agentMsg    = body;
+              if (!customerMsg && !isOwner) customerMsg = body;
+              if (agentMsg && customerMsg) break;
+            }
+          } catch(e) { /* no comments available */ }
+
+          // Fallback to EmailMessage (JSON) if CaseComment returned no agent response
+          if (!agentMsg) {
+            try {
+              const emailSoql = `SELECT TextBody, CreatedDate, Incoming FROM EmailMessage WHERE ParentId = '${caseId}' ORDER BY CreatedDate ASC LIMIT 200`;
+              const tmpESoql = path.join(os.tmpdir(), 'sf_qa_em.soql');
+              const tmpEJson = path.join(os.tmpdir(), 'sf_qa_em.json');
+              try { fs.unlinkSync(tmpEJson); } catch(e) {}
+              fs.writeFileSync(tmpESoql, emailSoql, 'utf8');
+              const { spawnSync } = require('child_process');
+              spawnSync('powershell', ['-Command',
+                `& '${SF_CMD}' data query --target-org ${SF_ORG} --result-format json --file '${tmpESoql}' --output-file '${tmpEJson}'; exit 0`
+              ], { timeout: 30000 });
+              const ejson = JSON.parse(fs.readFileSync(tmpEJson, 'utf8'));
+              const emails = (ejson.result && ejson.result.records) ? ejson.result.records : [];
+              for (let i = emails.length - 1; i >= 0; i--) {
+                const e = emails[i];
+                const body = (e.TextBody || '').trim();
+                if (!body) continue;
+                const isIncoming = e.Incoming === true || e.Incoming === 'true';
+                if (!agentMsg    && !isIncoming) agentMsg    = body;
+                if (!customerMsg && isIncoming)  customerMsg = body;
+                if (agentMsg && customerMsg) break;
+              }
+            } catch(e2) { /* ignore */ }
+          }
+
+          // Map SF Origin to scorecard channel
+          const originMap = {
+            'email': 'Email', 'live chat': 'Live Chat', 'chat': 'Live Chat',
+            'phone': 'Phone', 'customer community': 'Customer Community',
+            'community': 'Customer Community', 'web': 'Customer Community', 'portal': 'Customer Community'
+          };
+          const origin = (picked.Origin || '').trim();
+          const channel = originMap[origin.toLowerCase()] || origin || 'Customer Community';
+
+          resolve({
+            caseNumber,
+            caseId,
+            caseUrl:          'https://kaltura.lightning.force.com/lightning/r/Case/' + caseId + '/view',
+            ownerName:        agentName,
+            channel,
+            description:      (picked.Description || '').trim(),
+            customerLastMsg:  customerMsg,
+            agentLastMsg:     agentMsg,
+            totalCasesInPool: cases.length,
+            agentsInPool:     agentNames.length,
+          });
+        });
+      } catch(e) {
+        reject(new Error(stderr || (err && err.message) || e.message));
+      }
+    });
+  });
+}
+
+// ── Kaltura Admin Session ─────────────────────────────────────────────────────
+let kalturaAdminCookie = '';
+
+// ── Kaltura Entry Restore ─────────────────────────────────────────────────────
+function kalturaRestoreEntry(id) {
+  return new Promise((resolve) => {
+    const postBody = 'entryId=' + encodeURIComponent(id.trim());
+    const options = {
+      hostname: 'admin.kaltura.com',
+      path: '/admin_console/index.php/index/restore-entry-ajax',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'Content-Length': Buffer.byteLength(postBody),
+        'X-Requested-With': 'XMLHttpRequest',
+        'Origin': 'https://admin.kaltura.com',
+        'Referer': 'https://admin.kaltura.com/admin_console/index.php/index/entry-restoration',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        ...(kalturaAdminCookie ? { 'Cookie': kalturaAdminCookie } : {}),
+      }
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          resolve({ success: json.success === true, status: json.status || '', message: json.message || '' });
+        } catch(e) {
+          resolve({ success: false, message: 'Invalid response: ' + data.slice(0, 100) });
+        }
+      });
+    });
+    req.on('error', e => resolve({ success: false, message: e.message }));
+    req.write(postBody);
+    req.end();
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const pathname  = parsedUrl.pathname;
@@ -2685,6 +3544,26 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (method === 'GET' && pathname === '/api/general-cases') {
+    try {
+      const cases = await queryGeneralCases();
+      send(200, { cases });
+    } catch(e) { send(500, e.message, 'text/plain'); }
+    return;
+  }
+
+  if (method === 'GET' && pathname === '/api/general-stats') {
+    try { send(200, await queryGeneralStats()); }
+    catch(e) { send(500, e.message, 'text/plain'); }
+    return;
+  }
+
+  if (method === 'GET' && pathname === '/api/general-new-cases') {
+    try { send(200, await queryGeneralNewCases()); }
+    catch(e) { send(500, e.message, 'text/plain'); }
+    return;
+  }
+
   if (method === 'GET' && pathname === '/api/search-users') {
     const q = (parsedUrl.query.q || '').trim().replace(/'/g, "\\'");
     if (!q) { send(200, { users: [] }); return; }
@@ -2731,6 +3610,106 @@ const server = http.createServer(async (req, res) => {
       _teamUserIds = null; // reset SF user ID cache
       send(200, { teamNames: TEAM_NAMES });
     } catch(e) { send(500, e.message, 'text/plain'); }
+    return;
+  }
+
+  // ── QA Random Case ─────────────────────────────────────────────────────────
+  if (method === 'GET' && pathname === '/api/qa-random-case') {
+    try { send(200, await queryQaRandomCase(parsedUrl.query)); }
+    catch(e) { send(500, { error: e.message }, 'application/json'); }
+    return;
+  }
+
+  // ── Kaltura Admin Cookie Capture (one-time setup) ────────────────────────────
+  if (method === 'GET' && pathname === '/kaltura-cookie-capture') {
+    const captureHtml = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Connect Kaltura Admin</title>
+<style>
+  body{font-family:Segoe UI,Arial,sans-serif;background:#f4f7ff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+  .card{background:#fff;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.1);padding:36px 44px;max-width:600px;width:100%}
+  h2{color:#0052cc;margin:0 0 6px;font-size:20px}
+  .sub{color:#666;font-size:13px;margin-bottom:20px}
+  ol{padding-left:18px;color:#444;font-size:13px;line-height:2.2}
+  code{background:#e8f0fe;color:#0052cc;padding:2px 6px;border-radius:4px;font-size:12px;user-select:all}
+  .img-hint{background:#f8f9fa;border:1px solid #ddd;border-radius:6px;padding:8px 12px;font-size:11px;color:#555;margin:4px 0 0;display:block}
+  textarea{width:100%;height:80px;margin:12px 0;padding:10px;border:1px solid #ccc;border-radius:8px;font-size:12px;font-family:monospace;box-sizing:border-box}
+  button{background:#0052cc;color:#fff;border:none;border-radius:8px;padding:10px 24px;font-size:14px;font-weight:600;cursor:pointer;width:100%}
+  button:hover{background:#003d99}
+  .success{color:#1a7f37;font-weight:600;margin-top:12px;display:none}
+  .err{color:#b00;font-size:12px;margin-top:8px;display:none}
+</style></head>
+<body><div class="card">
+  <h2>Connect Kaltura Admin Console</h2>
+  <div class="sub">One-time setup — only needed again if your session expires.</div>
+  <ol>
+    <li>Open <a href="https://admin.kaltura.com/admin_console/index.php/index/entry-restoration" target="_blank">Kaltura Admin Console</a> and log in</li>
+    <li>Press <strong>F12</strong> to open DevTools → click the <strong>Network</strong> tab</li>
+    <li>Refresh the page (<strong>F5</strong>)</li>
+    <li>Click any request in the list (e.g. <code>entry-restoration</code>)</li>
+    <li>In the right panel, scroll to <strong>Request Headers</strong> → find <strong>cookie:</strong>
+      <span class="img-hint">It starts with something like: <code>PHPSESSID=abc123; ...</code></span>
+    </li>
+    <li>Right-click the <strong>cookie</strong> value → <strong>Copy value</strong>, then paste below</li>
+  </ol>
+  <textarea id="cookieInput" placeholder="Paste cookie header value here… (e.g. PHPSESSID=abc123; othercookie=xyz)"></textarea>
+  <button onclick="saveCookie()">Save & Connect</button>
+  <div class="success" id="ok">✓ Connected! You can close this tab and use the Restore button.</div>
+  <div class="err" id="err"></div>
+</div>
+<script>
+function saveCookie(){
+  const val = document.getElementById('cookieInput').value.trim();
+  if(!val){document.getElementById('err').textContent='Please paste the cookie first.';document.getElementById('err').style.display='block';return;}
+  fetch('http://localhost:3737/kaltura-cookie-save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie:val})})
+    .then(r=>r.json()).then(d=>{
+      if(d.ok){document.getElementById('ok').style.display='block';document.getElementById('err').style.display='none';if(window.opener&&window.opener.checkKalturaAdminStatus)window.opener.checkKalturaAdminStatus();setTimeout(()=>window.close(),3000);}
+      else{document.getElementById('err').textContent=d.error||'Failed';document.getElementById('err').style.display='block';}
+    }).catch(e=>{document.getElementById('err').textContent=e.message;document.getElementById('err').style.display='block';});
+}
+</script></body></html>`;
+    send(200, captureHtml, 'text/html');
+    return;
+  }
+
+  // ── Kaltura Admin connection status ──────────────────────────────────────
+  if (method === 'GET' && pathname === '/api/kaltura-status') {
+    send(200, { connected: !!kalturaAdminCookie });
+    return;
+  }
+
+  if (method === 'POST' && pathname === '/api/kaltura-disconnect') {
+    kalturaAdminCookie = '';
+    send(200, { ok: true });
+    return;
+  }
+
+  // ── Save Kaltura session cookie from capture page ─────────────────────────
+  if (method === 'POST' && pathname === '/kaltura-cookie-save') {
+    try {
+      const { cookie } = JSON.parse(await body());
+      if (!cookie) { send(400, { ok: false, error: 'No cookie provided' }); return; }
+      kalturaAdminCookie = cookie.trim();
+      send(200, { ok: true });
+    } catch(e) { send(500, { ok: false, error: e.message }); }
+    return;
+  }
+
+  // ── Kaltura Entry Restore ────────────────────────────────────────────────────
+  if (method === 'POST' && pathname === '/api/kaltura-restore') {
+    try {
+      const { entryId } = JSON.parse(await body());
+      if (!entryId) { send(400, { ok: false, error: 'No entryId provided' }); return; }
+      if (!kalturaAdminCookie) { send(401, { ok: false, error: 'Kaltura admin session not connected — use Connect Kaltura Admin first' }); return; }
+      // Process each entry ID one at a time (matching admin console behaviour)
+      const ids = entryId.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+      const results = [];
+      for (const id of ids) {
+        const result = await kalturaRestoreEntry(id);
+        results.push({ id, ...result });
+      }
+      const allOk = results.every(r => r.success);
+      send(200, { ok: allOk, results });
+    } catch(e) { send(500, { ok: false, error: e.message }); }
     return;
   }
 
